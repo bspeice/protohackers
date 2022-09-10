@@ -1,0 +1,14 @@
+repos:
+- repo: local
+  hooks:
+  - id: clang-format
+    name: clang-format
+    entry: clang-format -i
+    language: system
+    files: \.(c|cc|cxx|cpp|h|hpp|hxx|m)$
+  - id: clang-tidy
+    name: clang-tidy
+    entry: clang-tidy -p build/compile_commands.json
+    language: system
+    files: \.(c|cc|cxx|cpp|h|hpp|hxx|m)$
+    exclude: external/mir
