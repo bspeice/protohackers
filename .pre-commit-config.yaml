@@ -10,5 +10,5 @@ repos:
     name: clang-tidy
     entry: clang-tidy -p build/compile_commands.json
     language: system
-    files: \.(c|cc|cxx|cpp|h|hpp|hxx|m)$
+    files: \.(c|cc|cxx|cpp)$
     exclude: external/mir

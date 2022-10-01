@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.19)
+cmake_minimum_required(VERSION 3.20)
 project(protohackers)
 
 function(find_python_virtualenv python_executable virtualenv_root)
@@ -40,5 +40,8 @@ endif()
 include("${CMAKE_CURRENT_BINARY_DIR}/conanbuildinfo.cmake")
 conan_basic_setup(TARGETS)
 
-add_executable(0_smoke_test src/0_smoke_test.cpp)
-target_link_libraries(0_smoke_test CONAN_PKG::liburing)
+add_executable(0_smoke_test
+    src/common.cpp
+    src/0_smoke_test.cpp)
+set_property(TARGET 0_smoke_test PROPERTY CXX_STANDARD 20)
+target_link_libraries(0_smoke_test CONAN_PKG::liburing CONAN_PKG::fmt)
