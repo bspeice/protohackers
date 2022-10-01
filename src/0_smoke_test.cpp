@@ -107,7 +107,7 @@ int main() {
     }
 
     io_uring_prep_write(write_sqe, client_socket_fd, recv_buffer.data(),
-                        recv_bytes, 0);
+                        (std::size_t)recv_bytes, 0);
     io_uring_submit(&ring);
 
     io_uring_cqe *write_cqe;
