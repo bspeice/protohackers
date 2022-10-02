@@ -4,6 +4,7 @@
 #include <fmt/core.h>
 #include <iostream>
 #include <liburing.h>
+#include <memory>
 #include <netinet/in.h>
 #include <ranges>
 #include <system_error>
@@ -12,25 +13,90 @@ const u32 ENTRIES = 32;
 const usize BUF_ENTRIES = 32;
 const usize BUF_LEN = 2048;
 
+enum EventType : u32 {
+  ACCEPT,
+  RECV,
+  WRITE,
+  CLOSE,
+};
+
+typedef u32 ClientId;
+
+struct alignas(u64) ClientEvent {
+  EventType event;
+  ClientId client_id;
+
+  explicit ClientEvent(u64 data) { memcpy(this, &data, sizeof(u64)); }
+  explicit ClientEvent(EventType event, ClientId client_id)
+      : event{event}, client_id{client_id} {}
+
+  u64 to_u64() {
+    u64 data;
+    memcpy(&data, this, sizeof(u64));
+    return data;
+  }
+};
+static_assert(sizeof(ClientEvent) == sizeof(u64));
+
+struct Client {
+  int descriptor;
+  sockaddr_storage addr;
+  socklen_t addr_len;
+  std::array<u8, 2048> buffer;
+  std::size_t buffer_len;
+
+  [[nodiscard]] static std::unique_ptr<Client> init() {
+    return std::unique_ptr<Client>(new Client());
+  }
+
+private:
+  // Because addr/addr_len/buffer may be access by the kernel,
+  // clients must not move. Forcing construction in the heap
+  // is a simple way to accomplish that.
+  Client() {}
+};
+
+typedef std::unordered_map<ClientId, std::unique_ptr<Client>> ClientMap;
+
+void queue_accept(io_uring &ring, int server_fd, ClientId client_id,
+                  std::unique_ptr<Client> &client) {
+  auto *sqe = io_uring_get_sqe(&ring);
+  io_uring_prep_accept(sqe, server_fd, (sockaddr *)&client->addr,
+                       &client->addr_len, 0);
+  io_uring_sqe_set_data64(sqe,
+                          ClientEvent{EventType::ACCEPT, client_id}.to_u64());
+}
+
+void queue_recv(io_uring &ring, ClientId client_id,
+                std::unique_ptr<Client> &client) {
+  auto *sqe = io_uring_get_sqe(&ring);
+  io_uring_prep_recv(sqe, client->descriptor, client->buffer.data(),
+                     client->buffer.size(), 0);
+  io_uring_sqe_set_data64(sqe,
+                          ClientEvent{EventType::RECV, client_id}.to_u64());
+}
+
+void queue_write(io_uring &ring, ClientId client_id,
+                 std::unique_ptr<Client> &client) {
+  auto *sqe = io_uring_get_sqe(&ring);
+  io_uring_prep_write(sqe, client->descriptor, client->buffer.data(),
+                      client->buffer_len, 0);
+  io_uring_sqe_set_data64(sqe,
+                          ClientEvent{EventType::WRITE, client_id}.to_u64());
+}
+
+void queue_close(io_uring &ring, ClientId client_id,
+                 std::unique_ptr<Client> &client) {
+  auto *sqe = io_uring_get_sqe(&ring);
+  io_uring_prep_close(sqe, client->descriptor);
+  io_uring_sqe_set_data64(sqe,
+                          ClientEvent{EventType::CLOSE, client_id}.to_u64());
+}
+
 int main() {
   // Set up the initial IO ring
   io_uring ring;
   OS_ERR(io_uring_queue_init(ENTRIES, &ring, 0));
-
-  /*
-  // Set up the IO ring buffers
-  std::array<std::array<u8, BUF_LEN>, BUF_ENTRIES> buffers{};
-  io_uring_buf_ring buf_ring;
-  io_uring_buf_ring_init(&buf_ring);
-
-  auto buf_ring_mask = io_uring_buf_ring_mask(BUF_ENTRIES);
-  for (auto i = 0; i < buffers.size(); i++) {
-      auto& buffer = buffers[i];
-      io_uring_buf_ring_add(&buf_ring, &buffer, buffer.size(), i, buf_ring_mask,
-  i);
-  }
-  io_uring_buf_ring_advance(&buf_ring, BUF_ENTRIES);
-  */
 
   // Initialize a socket
   // Can't seem to use `io_uring_prep_socket` right now?
@@ -42,87 +108,58 @@ int main() {
   bind(socket_fd, (sockaddr *)&socket_addr, sizeof(socket_addr));
   listen(socket_fd, 10);
 
-  // Wait for connection accept
-  auto *accept_sqe = io_uring_get_sqe(&ring);
-  if (!accept_sqe) {
-    return -1;
-  }
+  ClientMap clients{};
 
-  sockaddr client_addr{};
-  socklen_t client_addr_len{};
-  io_uring_prep_accept(accept_sqe, socket_fd, &client_addr, &client_addr_len,
-                       0);
+  ClientId pending_id{};
+  auto pending_client = Client::init();
+
+  queue_accept(ring, socket_fd, pending_id, pending_client);
   io_uring_submit(&ring);
 
-  // Wait for the connection
-  io_uring_cqe *accept_cqe;
-  OS_ERR(io_uring_wait_cqe(&ring, &accept_cqe));
-  if (accept_cqe->res < 0) {
-    return -accept_cqe->res;
-  }
-  auto client_socket_fd = accept_cqe->res;
-  io_uring_cqe_seen(&ring, accept_cqe);
-
-  // Read from the socket
   while (true) {
-    std::array<char, 1024> recv_buffer{};
+    io_uring_cqe *cqe;
+    io_uring_wait_cqe(&ring, &cqe);
 
-    auto *recv_sqe = io_uring_get_sqe(&ring);
-    if (!recv_sqe) {
-      return -1;
-    }
+    ClientEvent client_event{io_uring_cqe_get_data64(cqe)};
+    switch (client_event.event) {
+    case EventType::ACCEPT: {
+      pending_client->descriptor = cqe->res;
+      queue_recv(ring, pending_id, pending_client);
 
-    io_uring_prep_recv(recv_sqe, client_socket_fd, recv_buffer.data(),
-                       recv_buffer.size(), 0);
-    io_uring_submit(&ring);
+      clients[pending_id] = std::move(pending_client);
 
-    io_uring_cqe *recv_cqe;
-    OS_ERR(io_uring_wait_cqe(&ring, &recv_cqe));
-    if (!recv_cqe || recv_cqe->res < 0) {
-      return !recv_cqe || -recv_cqe->res;
-    }
-
-    auto recv_bytes = recv_cqe->res;
-    io_uring_cqe_seen(&ring, recv_cqe);
-
-    if (recv_bytes == 0) {
-      auto *close_sqe = io_uring_get_sqe(&ring);
-      if (!close_sqe) {
-        return -1;
-      }
-
-      io_uring_prep_close(close_sqe, client_socket_fd);
-      io_uring_submit(&ring);
-      io_uring_cqe *close_cqe;
-      OS_ERR(io_uring_wait_cqe(&ring, &close_cqe));
+      pending_id += 1;
+      pending_client = Client::init();
+      queue_accept(ring, socket_fd, pending_id, pending_client);
       break;
     }
 
-    std::string_view recv_data{recv_buffer.data(), (std::size_t)recv_bytes};
-    fmt::print("Received: {}\n", recv_data);
-
-    auto *write_sqe = io_uring_get_sqe(&ring);
-    if (!write_sqe) {
-      return -1;
+    case EventType::RECV: {
+      auto bytes = cqe->res;
+      auto &client = clients.at(client_event.client_id);
+      if (bytes == 0) {
+        queue_close(ring, client_event.client_id, client);
+      } else {
+        client->buffer_len = cqe->res;
+        queue_write(ring, client_event.client_id, client);
+      }
+      break;
     }
 
-    io_uring_prep_write(write_sqe, client_socket_fd, recv_buffer.data(),
-                        (std::size_t)recv_bytes, 0);
+    case EventType::WRITE: {
+      queue_recv(ring, client_event.client_id,
+                 clients.at(client_event.client_id));
+      break;
+    }
+
+    case EventType::CLOSE: {
+      clients.erase(client_event.client_id);
+      break;
+    }
+    }
+
+    io_uring_cqe_seen(&ring, cqe);
     io_uring_submit(&ring);
-
-    io_uring_cqe *write_cqe;
-    OS_ERR(io_uring_wait_cqe(&ring, &write_cqe));
-    io_uring_cqe_seen(&ring, write_cqe);
-
-    /*
-    auto recv_bytes = recv(client_socket_fd, recv_buffer.data(),
-    recv_buffer.size(), 0);
-
-    if (recv_bytes == 0) {
-        close(client_socket_fd);
-        break;
-    }
-    */
   }
 
   io_uring_queue_exit(&ring);
