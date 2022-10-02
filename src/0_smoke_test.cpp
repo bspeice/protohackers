@@ -35,20 +35,20 @@ struct alignas(u64) ClientEvent {
 static_assert(sizeof(ClientEvent) == sizeof(u64));
 
 struct Client {
+  // Because we submit raw addresses from this struct to the kernel,
+  // preventing all moves is a simple way to guarantee their lifetime
+  // for the duration of the completion request.
+  // A more defensive variation would also include a flag that is set
+  // on submission, cleared on completion, and the destructor warns about.
+  NONCOPYABLE(Client)
+  NONMOVEABLE(Client)
+
   int descriptor;
   sockaddr_storage addr;
   socklen_t addr_len;
   std::array<u8, 2048> buffer;
   std::size_t buffer_len;
 
-  [[nodiscard]] static std::unique_ptr<Client> init() {
-    return std::unique_ptr<Client>(new Client());
-  }
-
-private:
-  // Because addr/addr_len/buffer may be access by the kernel,
-  // clients must not move. Forcing construction in the heap
-  // is a simple way to accomplish that.
   Client() {}
 };
 
@@ -103,7 +103,7 @@ int main() {
   ClientMap clients{};
 
   ClientId pending_id{};
-  auto pending_client = Client::init();
+  auto pending_client = std::unique_ptr<Client>(new Client());
 
   queue_accept(ring, socket_fd, pending_id, pending_client);
   io_uring_submit(&ring);
@@ -121,7 +121,7 @@ int main() {
       clients[pending_id] = std::move(pending_client);
 
       pending_id += 1;
-      pending_client = Client::init();
+      pending_client = std::unique_ptr<Client>(new Client());
       queue_accept(ring, socket_fd, pending_id, pending_client);
       break;
     }
