@@ -30,11 +30,7 @@ struct alignas(u64) ClientEvent {
   explicit ClientEvent(EventType event, ClientId client_id)
       : event{event}, client_id{client_id} {}
 
-  u64 to_u64() {
-    u64 data;
-    memcpy(&data, this, sizeof(u64));
-    return data;
-  }
+  operator u64() { return *static_cast<u64 *>(static_cast<void *>(this)); }
 };
 static_assert(sizeof(ClientEvent) == sizeof(u64));
 
@@ -63,8 +59,7 @@ void queue_accept(io_uring &ring, int server_fd, ClientId client_id,
   auto *sqe = io_uring_get_sqe(&ring);
   io_uring_prep_accept(sqe, server_fd, (sockaddr *)&client->addr,
                        &client->addr_len, 0);
-  io_uring_sqe_set_data64(sqe,
-                          ClientEvent{EventType::ACCEPT, client_id}.to_u64());
+  io_uring_sqe_set_data64(sqe, ClientEvent{EventType::ACCEPT, client_id});
 }
 
 void queue_recv(io_uring &ring, ClientId client_id,
@@ -72,8 +67,7 @@ void queue_recv(io_uring &ring, ClientId client_id,
   auto *sqe = io_uring_get_sqe(&ring);
   io_uring_prep_recv(sqe, client->descriptor, client->buffer.data(),
                      client->buffer.size(), 0);
-  io_uring_sqe_set_data64(sqe,
-                          ClientEvent{EventType::RECV, client_id}.to_u64());
+  io_uring_sqe_set_data64(sqe, ClientEvent{EventType::RECV, client_id});
 }
 
 void queue_write(io_uring &ring, ClientId client_id,
@@ -81,16 +75,14 @@ void queue_write(io_uring &ring, ClientId client_id,
   auto *sqe = io_uring_get_sqe(&ring);
   io_uring_prep_write(sqe, client->descriptor, client->buffer.data(),
                       client->buffer_len, 0);
-  io_uring_sqe_set_data64(sqe,
-                          ClientEvent{EventType::WRITE, client_id}.to_u64());
+  io_uring_sqe_set_data64(sqe, ClientEvent{EventType::WRITE, client_id});
 }
 
 void queue_close(io_uring &ring, ClientId client_id,
                  std::unique_ptr<Client> &client) {
   auto *sqe = io_uring_get_sqe(&ring);
   io_uring_prep_close(sqe, client->descriptor);
-  io_uring_sqe_set_data64(sqe,
-                          ClientEvent{EventType::CLOSE, client_id}.to_u64());
+  io_uring_sqe_set_data64(sqe, ClientEvent{EventType::CLOSE, client_id});
 }
 
 int main() {
